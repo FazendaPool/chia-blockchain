@@ -79,7 +79,7 @@ def generate_test_spend_bundle(
     return transaction
 
 
-@pytest_asyncio.fixture(scope="module")
+@pytest_asyncio.fixture(scope="function")
 async def two_nodes_mempool(bt, wallet_a):
     async_gen = setup_simulators_and_wallets(2, 1, {})
     nodes, _ = await async_gen.__anext__()
@@ -94,7 +94,10 @@ async def two_nodes_mempool(bt, wallet_a):
         guarantee_transaction_block=True,
         farmer_reward_puzzle_hash=reward_ph,
         pool_reward_puzzle_hash=reward_ph,
+        genesis_timestamp=10000,
+        time_per_block=10,
     )
+    assert blocks[0].height == 0
 
     for block in blocks:
         await full_node_1.full_node.respond_block(full_node_protocol.RespondBlock(block))
@@ -108,15 +111,13 @@ async def two_nodes_mempool(bt, wallet_a):
 
 
 def make_item(idx: int, cost: uint64 = uint64(80)) -> MempoolItem:
-    spend_bundle_name = bytes([idx] * 32)
-    # TODO: address hint error and remove ignore
-    #       error: Argument 5 to "MempoolItem" has incompatible type "bytes"; expected "bytes32"  [arg-type]
+    spend_bundle_name = bytes32([idx] * 32)
     return MempoolItem(
         SpendBundle([], G2Element()),
         uint64(0),
         NPCResult(None, [], cost),
         cost,
-        spend_bundle_name,  # type: ignore[arg-type]
+        spend_bundle_name,
         [],
         [],
         SerializedProgram(),
@@ -235,6 +236,8 @@ async def next_block(full_node_1, wallet_a, bt) -> Coin:
         guarantee_transaction_block=True,
         farmer_reward_puzzle_hash=reward_ph,
         pool_reward_puzzle_hash=reward_ph,
+        genesis_timestamp=10000,
+        time_per_block=10,
     )
 
     for block in blocks:
@@ -255,7 +258,7 @@ class TestMempoolManager:
         spend_bundle = generate_test_spend_bundle(wallet_a, coin)
         assert spend_bundle is not None
         tx: full_node_protocol.RespondTransaction = full_node_protocol.RespondTransaction(spend_bundle)
-        await full_node_1.respond_transaction(tx, peer)
+        await full_node_1.respond_transaction(tx, peer, test=True)
 
         await time_out_assert(
             10,
@@ -277,17 +280,17 @@ class TestMempoolManager:
             (ConditionOpcode.ASSERT_HEIGHT_RELATIVE, 0, MempoolInclusionStatus.PENDING),
             (ConditionOpcode.ASSERT_HEIGHT_RELATIVE, 1, MempoolInclusionStatus.PENDING),
             # the absolute height and seconds tests require fresh full nodes to
-            # run the test on. Right now, we just launch two simulations and all
-            # tests use the same ones. See comment at the two_nodes_mempool fixture
-            # (ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE, 2, MempoolInclusionStatus.SUCCESS),
-            # (ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE, 3, MempoolInclusionStatus.SUCCESS),
-            # (ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE, 4, MempoolInclusionStatus.PENDING),
-            # (ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE, 5, MempoolInclusionStatus.PENDING),
+            # run the test on. The fixture (two_nodes_mempool) creates 3 blocks,
+            # then condition_tester2 creates another 3 blocks
+            (ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE, 4, MempoolInclusionStatus.SUCCESS),
+            (ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE, 5, MempoolInclusionStatus.SUCCESS),
+            (ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE, 6, MempoolInclusionStatus.PENDING),
+            (ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE, 7, MempoolInclusionStatus.PENDING),
             # genesis timestamp is 10000 and each block is 10 seconds
-            # (ConditionOpcode.ASSERT_SECONDS_ABSOLUTE, 10029, MempoolInclusionStatus.SUCCESS),
-            # (ConditionOpcode.ASSERT_SECONDS_ABSOLUTE, 10030, MempoolInclusionStatus.SUCCESS),
-            # (ConditionOpcode.ASSERT_SECONDS_ABSOLUTE, 10031, MempoolInclusionStatus.FAILED),
-            # (ConditionOpcode.ASSERT_SECONDS_ABSOLUTE, 10032, MempoolInclusionStatus.FAILED),
+            (ConditionOpcode.ASSERT_SECONDS_ABSOLUTE, 10049, MempoolInclusionStatus.SUCCESS),
+            (ConditionOpcode.ASSERT_SECONDS_ABSOLUTE, 10050, MempoolInclusionStatus.SUCCESS),
+            (ConditionOpcode.ASSERT_SECONDS_ABSOLUTE, 10051, MempoolInclusionStatus.FAILED),
+            (ConditionOpcode.ASSERT_SECONDS_ABSOLUTE, 10052, MempoolInclusionStatus.FAILED),
         ],
     )
     async def test_ephemeral_timelock(self, bt, two_nodes_mempool, wallet_a, opcode, lock_value, expected):
@@ -392,7 +395,7 @@ class TestMempoolManager:
 
         assert spend_bundle1 is not None
         tx1: full_node_protocol.RespondTransaction = full_node_protocol.RespondTransaction(spend_bundle1)
-        status, err = await respond_transaction(full_node_1, tx1, peer)
+        status, err = await respond_transaction(full_node_1, tx1, peer, test=True)
         assert err is None
         assert status == MempoolInclusionStatus.SUCCESS
 
@@ -403,7 +406,7 @@ class TestMempoolManager:
         )
         assert spend_bundle2 is not None
         tx2: full_node_protocol.RespondTransaction = full_node_protocol.RespondTransaction(spend_bundle2)
-        status, err = await respond_transaction(full_node_1, tx2, peer)
+        status, err = await respond_transaction(full_node_1, tx2, peer, test=True)
 
         sb1 = full_node_1.full_node.mempool_manager.get_spendbundle(spend_bundle1.name())
         sb2 = full_node_1.full_node.mempool_manager.get_spendbundle(spend_bundle2.name())
@@ -415,7 +418,7 @@ class TestMempoolManager:
 
     async def send_sb(self, node: FullNodeAPI, sb: SpendBundle) -> Optional[Message]:
         tx = wallet_protocol.SendTransaction(sb)
-        return await node.send_transaction(tx)
+        return await node.send_transaction(tx, test=True)
 
     async def gen_and_send_sb(self, node, peer, *args, **kwargs):
         sb = generate_test_spend_bundle(*args, **kwargs)
@@ -575,7 +578,7 @@ class TestMempoolManager:
 
         tx1: full_node_protocol.RespondTransaction = full_node_protocol.RespondTransaction(spend_bundle1)
 
-        status, err = await respond_transaction(full_node_1, tx1, peer)
+        status, err = await respond_transaction(full_node_1, tx1, peer, test=True)
         return blocks, spend_bundle1, peer, status, err
 
     @pytest.mark.asyncio
@@ -590,6 +593,7 @@ class TestMempoolManager:
             guarantee_transaction_block=True,
             farmer_reward_puzzle_hash=reward_ph,
             pool_reward_puzzle_hash=reward_ph,
+            time_per_block=10,
         )
         peer = await connect_and_get_peer(server_1, server_2, bt.config["self_hostname"])
 
@@ -919,7 +923,7 @@ class TestMempoolManager:
 
         tx2: full_node_protocol.RespondTransaction = full_node_protocol.RespondTransaction(spend_bundle1)
 
-        status, err = await respond_transaction(full_node_1, tx2, peer)
+        status, err = await respond_transaction(full_node_1, tx2, peer, test=True)
 
         sb1 = full_node_1.full_node.mempool_manager.get_spendbundle(spend_bundle1.name())
         assert err is None
@@ -1459,7 +1463,7 @@ class TestMempoolManager:
 
         tx1: full_node_protocol.RespondTransaction = full_node_protocol.RespondTransaction(spend_bundle1)
 
-        status, err = await respond_transaction(full_node_1, tx1, peer)
+        status, err = await respond_transaction(full_node_1, tx1, peer, test=True)
 
         mempool_bundle = full_node_1.full_node.mempool_manager.get_spendbundle(spend_bundle1.name())
 
@@ -1506,7 +1510,7 @@ class TestMempoolManager:
         tx: full_node_protocol.RespondTransaction = full_node_protocol.RespondTransaction(spend_bundle_combined)
 
         peer = await connect_and_get_peer(server_1, server_2, bt.config["self_hostname"])
-        status, err = await respond_transaction(full_node_1, tx, peer)
+        status, err = await respond_transaction(full_node_1, tx, peer, test=True)
 
         sb = full_node_1.full_node.mempool_manager.get_spendbundle(spend_bundle_combined.name())
         assert err == Err.DOUBLE_SPEND
@@ -1556,7 +1560,7 @@ class TestMempoolManager:
         # assert spend_bundle is not None
         #
         # tx: full_node_protocol.RespondTransaction = full_node_protocol.RespondTransaction(spend_bundle)
-        # await full_node_1.respond_transaction(tx, peer)
+        # await full_node_1.respond_transaction(tx, peer, test=True)
         #
         # sb = full_node_1.full_node.mempool_manager.get_spendbundle(spend_bundle.name())
         # assert sb is spend_bundle
@@ -2449,7 +2453,7 @@ class TestMaliciousGenerators:
         coin_spend_0 = recursive_replace(spend_bundle.coin_spends[0], "coin.puzzle_hash", bytes32([1] * 32))
         new_bundle = recursive_replace(spend_bundle, "coin_spends", [coin_spend_0] + spend_bundle.coin_spends[1:])
         assert spend_bundle is not None
-        res = await full_node_1.full_node.respond_transaction(new_bundle, new_bundle.name())
+        res = await full_node_1.full_node.respond_transaction(new_bundle, new_bundle.name(), test=True)
         assert res == (MempoolInclusionStatus.FAILED, Err.INVALID_SPEND_BUNDLE)
 
 

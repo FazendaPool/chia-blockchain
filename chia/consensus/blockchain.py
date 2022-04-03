@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import multiprocessing
 import traceback
+from concurrent.futures import Executor
 from concurrent.futures.process import ProcessPoolExecutor
 from enum import Enum
 from multiprocessing.context import BaseContext
@@ -47,6 +48,7 @@ from chia.types.unfinished_header_block import UnfinishedHeaderBlock
 from chia.types.weight_proof import SubEpochChallengeSegment
 from chia.util.errors import ConsensusError, Err
 from chia.util.generator_tools import get_block_header, tx_removals_and_additions
+from chia.util.inline_executor import InlineExecutor
 from chia.util.ints import uint16, uint32, uint64, uint128
 from chia.util.setproctitle import getproctitle, setproctitle
 from chia.util.streamable import recurse_jsonify
@@ -86,7 +88,7 @@ class Blockchain(BlockchainInterface):
     # Store
     block_store: BlockStore
     # Used to verify blocks in parallel
-    pool: ProcessPoolExecutor
+    pool: Executor
     # Set holding seen compact proofs, in order to avoid duplicates.
     _seen_compact_proofs: Set[Tuple[VDFInfo, uint32]]
 
@@ -107,6 +109,8 @@ class Blockchain(BlockchainInterface):
         blockchain_dir: Path,
         reserved_cores: int,
         multiprocessing_context: Optional[BaseContext] = None,
+        *,
+        single_threaded: bool = False,
     ):
         """
         Initializes a blockchain with the BlockRecords from disk, assuming they have all been
@@ -116,17 +120,20 @@ class Blockchain(BlockchainInterface):
         self = Blockchain()
         self.lock = asyncio.Lock()  # External lock handled by full node
         self.compact_proof_lock = asyncio.Lock()
-        cpu_count = multiprocessing.cpu_count()
-        if cpu_count > 61:
-            cpu_count = 61  # Windows Server 2016 has an issue https://bugs.python.org/issue26903
-        num_workers = max(cpu_count - reserved_cores, 1)
-        self.pool = ProcessPoolExecutor(
-            max_workers=num_workers,
-            mp_context=multiprocessing_context,
-            initializer=setproctitle,
-            initargs=(f"{getproctitle()}_worker",),
-        )
-        log.info(f"Started {num_workers} processes for block validation")
+        if single_threaded:
+            self.pool = InlineExecutor()
+        else:
+            cpu_count = multiprocessing.cpu_count()
+            if cpu_count > 61:
+                cpu_count = 61  # Windows Server 2016 has an issue https://bugs.python.org/issue26903
+            num_workers = max(cpu_count - reserved_cores, 1)
+            self.pool = ProcessPoolExecutor(
+                max_workers=num_workers,
+                mp_context=multiprocessing_context,
+                initializer=setproctitle,
+                initargs=(f"{getproctitle()}_worker",),
+            )
+            log.info(f"Started {num_workers} processes for block validation")
 
         self.constants = consensus_constants
         self.coin_store = coin_store
@@ -175,10 +182,9 @@ class Blockchain(BlockchainInterface):
         if self._peak_height is None:
             return None
         """ Return list of FullBlocks that are peaks"""
-        # TODO: address hint error and remove ignore
-        #       error: Argument 1 to "get_full_block" of "BlockStore" has incompatible type "Optional[bytes32]";
-        #       expected "bytes32"  [arg-type]
-        block = await self.block_store.get_full_block(self.height_to_hash(self._peak_height))  # type: ignore[arg-type]
+        peak_hash: Optional[bytes32] = self.height_to_hash(self._peak_height)
+        assert peak_hash is not None  # Since we must have the peak block
+        block = await self.block_store.get_full_block(peak_hash)
         assert block is not None
         return block
 
@@ -257,19 +263,19 @@ class Blockchain(BlockchainInterface):
             None,
         )
         # Always add the block to the database
-        async with self.block_store.db_wrapper.lock:
+        async with self.block_store.db_wrapper.write_db():
             try:
                 header_hash: bytes32 = block.header_hash
                 # Perform the DB operations to update the state, and rollback if something goes wrong
-                await self.block_store.db_wrapper.begin_transaction()
                 await self.block_store.add_full_block(header_hash, block, block_record)
                 fork_height, peak_height, records, (coin_record_change, hint_changes) = await self._reconsider_peak(
                     block_record, genesis, fork_point_with_peak, npc_result
                 )
-                await self.block_store.db_wrapper.commit_transaction()
 
                 # Then update the memory cache. It is important that this task is not cancelled and does not throw
                 self.add_block_record(block_record)
+                if fork_height is not None:
+                    self.__height_map.rollback(fork_height)
                 for fetched_block_record in records:
                     self.__height_map.update_height(
                         fetched_block_record.height,
@@ -281,7 +287,6 @@ class Blockchain(BlockchainInterface):
                     await self.__height_map.maybe_flush()
             except BaseException as e:
                 self.block_store.rollback_cache_block(header_hash)
-                await self.block_store.db_wrapper.rollback_transaction()
                 log.error(
                     f"Error while adding block {block.header_hash} height {block.height},"
                     f" rolling back: {traceback.format_exc()} {e}"
@@ -302,12 +307,9 @@ class Blockchain(BlockchainInterface):
                 if opcode == ConditionOpcode.CREATE_COIN:
                     for condition in conditions:
                         if len(condition.vars) > 2 and condition.vars[2] != b"":
-                            puzzle_hash, amount_bin = condition.vars[0], condition.vars[1]
-                            amount = int_from_bytes(amount_bin)
-                            # TODO: address hint error and remove ignore
-                            #       error: Argument 2 to "Coin" has incompatible type "bytes"; expected "bytes32"
-                            #       [arg-type]
-                            coin_id = Coin(npc.coin_name, puzzle_hash, amount).name()  # type: ignore[arg-type]
+                            puzzle_hash, amount_bin = bytes32(condition.vars[0]), condition.vars[1]
+                            amount: uint64 = uint64(int_from_bytes(amount_bin))
+                            coin_id: bytes32 = Coin(npc.coin_name, puzzle_hash, amount).name()
                             h_list.append((coin_id, condition.vars[2]))
         return h_list
 
@@ -377,10 +379,6 @@ class Blockchain(BlockchainInterface):
             for coin_record in roll_changes:
                 latest_coin_state[coin_record.name] = coin_record
 
-        # Rollback sub_epoch_summaries
-        self.__height_map.rollback(fork_height)
-        await self.block_store.rollback(fork_height)
-
         # Collect all blocks from fork point to new peak
         blocks_to_add: List[Tuple[FullBlock, BlockRecord]] = []
         curr = block_record.header_hash
@@ -441,6 +439,9 @@ class Blockchain(BlockchainInterface):
                         hint_coin_state[key] = {}
                     hint_coin_state[key][coin_id] = latest_coin_state[coin_id]
 
+        # we made it to the end successfully
+        # Rollback sub_epoch_summaries
+        await self.block_store.rollback(fork_height)
         await self.block_store.set_in_chain([(br.header_hash,) for br in records_to_add])
 
         # Changes the peak to be the new peak
@@ -674,11 +675,11 @@ class Blockchain(BlockchainInterface):
         return self.__block_records[header_hash]
 
     def height_to_block_record(self, height: uint32) -> BlockRecord:
-        header_hash = self.height_to_hash(height)
-        # TODO: address hint error and remove ignore
-        #       error: Argument 1 to "block_record" of "Blockchain" has incompatible type "Optional[bytes32]"; expected
-        #       "bytes32"  [arg-type]
-        return self.block_record(header_hash)  # type: ignore[arg-type]
+        # Precondition: height is in the blockchain
+        header_hash: Optional[bytes32] = self.height_to_hash(height)
+        if header_hash is None:
+            raise ValueError(f"Height is not in blockchain: {height}")
+        return self.block_record(header_hash)
 
     def get_ses_heights(self) -> List[uint32]:
         return self.__height_map.get_ses_heights()
@@ -757,10 +758,8 @@ class Blockchain(BlockchainInterface):
         hashes = []
         for height in range(start, stop + 1):
             if self.contains_height(uint32(height)):
-                # TODO: address hint error and remove ignore
-                #       error: Incompatible types in assignment (expression has type "Optional[bytes32]", variable has
-                #       type "bytes32")  [assignment]
-                header_hash: bytes32 = self.height_to_hash(uint32(height))  # type: ignore[assignment]
+                header_hash: Optional[bytes32] = self.height_to_hash(uint32(height))
+                assert header_hash is not None
                 hashes.append(header_hash)
 
         blocks: List[FullBlock] = []
@@ -805,23 +804,20 @@ class Blockchain(BlockchainInterface):
         gets block records by height (only blocks that are part of the chain)
         """
         records: List[BlockRecord] = []
-        hashes = []
+        hashes: List[bytes32] = []
         assert batch_size < 999  # sqlite in python 3.7 has a limit on 999 variables in queries
         for height in heights:
-            hashes.append(self.height_to_hash(height))
+            header_hash: Optional[bytes32] = self.height_to_hash(height)
+            if header_hash is None:
+                raise ValueError(f"Do not have block at height {height}")
+            hashes.append(header_hash)
             if len(hashes) > batch_size:
-                # TODO: address hint error and remove ignore
-                #       error: Argument 1 to "get_block_records_by_hash" of "BlockStore" has incompatible type
-                #       "List[Optional[bytes32]]"; expected "List[bytes32]"  [arg-type]
-                res = await self.block_store.get_block_records_by_hash(hashes)  # type: ignore[arg-type]
+                res = await self.block_store.get_block_records_by_hash(hashes)
                 records.extend(res)
                 hashes = []
 
         if len(hashes) > 0:
-            # TODO: address hint error and remove ignore
-            #       error: Argument 1 to "get_block_records_by_hash" of "BlockStore" has incompatible type
-            #       "List[Optional[bytes32]]"; expected "List[bytes32]"  [arg-type]
-            res = await self.block_store.get_block_records_by_hash(hashes)  # type: ignore[arg-type]
+            res = await self.block_store.get_block_records_by_hash(hashes)
             records.extend(res)
         return records
 
